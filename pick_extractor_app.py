@@ -1,132 +1,122 @@
 import streamlit as st
 import fitz  # PyMuPDF
+import pandas as pd
 import re
 from fpdf import FPDF
 import tempfile
-import os
 
-# === Parse Compact Line ===
-def parse_single_line(line):
-    parts = line.strip().split()
-    if 'EA' not in parts or len(parts) < 7:
-        return None
-    try:
-        ea_idx = parts.index('EA')
-        part_no = parts[0]
-        description = " ".join(parts[1:ea_idx])
-        qty_ordered = int(parts[ea_idx + 1])
-        qty_committed = int(parts[ea_idx + 2])
-        qty_bo = int(parts[ea_idx + 3])
-        return {
-            "pick_display": "",  # will fill later
-            "part_no": part_no,
-            "description": description.strip(),
-            "qty_ordered": qty_ordered,
-            "qty_committed": qty_committed,
-            "qty_bo": qty_bo
-        }
-    except:
-        return None
+st.set_page_config(page_title="PICK Ticket PDF Extractor", layout="wide")
 
-# === Parse Multi-Line Block ===
-def parse_multi_line(lines, i):
-    try:
-        pick_raw = lines[i + 1].strip()
-        pick_display = re.match(r'(\d+)', pick_raw).group()
+st.title("📄 PICK Ticket PDF Extractor")
+st.markdown("#### 📤 Upload your PICKING TICKET PDF")
 
-        part_line = lines[i + 2].strip()
-        desc_line = lines[i + 3].strip()
+uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
 
-        next_line = lines[i + 4].strip()
-        if next_line == "EA":
-            description = desc_line
-            ea_index = i + 4
-        else:
-            description = f"{desc_line} {next_line}"
-            ea_index = i + 5
+# Helper to safely encode text
+def safe_text(text):
+    return str(text).encode('latin-1', errors='replace').decode('latin-1')
 
-        qty_line = lines[ea_index + 1:ea_index + 4]
-        qtys = list(map(int, qty_line))
-
-        return {
-            "pick_display": pick_display,
-            "part_no": part_line,
-            "description": description.strip(),
-            "qty_ordered": qtys[0],
-            "qty_committed": qtys[1],
-            "qty_bo": qtys[2]
-        }, ea_index + 4
-    except:
-        return None, i + 1
-
-# === PDF Generator ===
+# PDF Export with Row/Column Formatting
 def generate_pdf(sorted_entries):
     pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, "Sorted PICK Report", ln=True, align='C')
-    pdf.ln(5)
+    pdf.set_font("Arial", size=10)
 
-    for entry in sorted_entries:
-        pdf.cell(0, 10, f"PICK {entry['pick_display']}", ln=True)
-        pdf.cell(0, 10, f"  Part #: {entry['part_no']}", ln=True)
-        pdf.cell(0, 10, f"  Description: {entry['description']}", ln=True)
-        pdf.cell(0, 10, f"  Qty Ordered: {entry['qty_ordered']}, Committed: {entry['qty_committed']}, B/O: {entry['qty_bo']}", ln=True)
-        pdf.ln(2)
+    headers = ["PICK", "Part #", "Description", "Qty Ordered", "Qty Committed", "Qty B/O"]
+    widths = [20, 40, 80, 20, 20, 15]
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpfile:
-        pdf.output(tmpfile.name)
-        return tmpfile.name
+    for h, w in zip(headers, widths):
+        pdf.cell(w, 10, safe_text(h), border=1)
+    pdf.ln()
 
-# === Streamlit App ===
-st.set_page_config(page_title="PICK Ticket Extractor", layout="centered")
-st.title("📦 PICK Ticket Extractor")
+    for row in sorted_entries:
+        data = [
+            row["pick"],
+            row["part_no"],
+            row["description"],
+            row["qty_ordered"],
+            row["qty_committed"],
+            row["qty_bo"]
+        ]
+        for d, w in zip(data, widths):
+            pdf.cell(w, 10, safe_text(d), border=1)
+        pdf.ln()
 
-uploaded_file = st.file_uploader("Upload your Picking Ticket PDF", type=["pdf"])
+    tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf.output(tmpfile.name)
+    return tmpfile.name
 
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(uploaded_file.read())
-        pdf_path = tmp.name
-
-    doc = fitz.open(pdf_path)
+# Extraction logic
+def extract_picks_from_pdf(file):
+    doc = fitz.open(stream=file.read(), filetype="pdf")
     lines = []
     for page in doc:
         lines += page.get_text().splitlines()
 
     entries = []
     i = 0
+
     while i < len(lines):
-        line = lines[i].strip()
-        if line == "PICK":
-            block, new_i = parse_multi_line(lines, i)
-            if block:
-                entries.append(block)
-            i = new_i
+        if lines[i].strip() == "PICK":
+            try:
+                pick_number = re.sub(r"[^\d]", "", lines[i + 1].strip())  # Keep only digits
+                part_no = lines[i + 2].strip()
+                next_line = lines[i + 3].strip()
+
+                if next_line == "EA":
+                    description = ""
+                    ea_index = i + 3
+                else:
+                    next_next_line = lines[i + 4].strip()
+                    if next_next_line == "EA":
+                        description = next_line
+                        ea_index = i + 4
+                    else:
+                        description = f"{next_line} {next_next_line}"
+                        ea_index = i + 5
+
+                unit = lines[ea_index]
+                qty_ordered = int(lines[ea_index + 1])
+                qty_committed = int(lines[ea_index + 2])
+                qty_bo = int(lines[ea_index + 3])
+
+                entries.append({
+                    "sort_key": int(pick_number),
+                    "pick": pick_number,
+                    "part_no": part_no,
+                    "description": description.strip(),
+                    "qty_ordered": qty_ordered,
+                    "qty_committed": qty_committed,
+                    "qty_bo": qty_bo
+                })
+
+                i = ea_index + 4
+            except Exception as e:
+                i += 1
         else:
-            single = parse_single_line(line)
-            if single:
-                match = re.search(r"PICK\s+(\d+)", "\n".join(lines[max(i - 3, 0):i + 1]))
-                if match:
-                    single["pick_display"] = match.group(1)
-                entries.append(single)
             i += 1
 
-    if entries:
-        sorted_entries = sorted(entries, key=lambda x: int(re.match(r'\d+', x["pick_display"]).group()))
-        st.success("✅ Entries successfully parsed and sorted!")
+    sorted_entries = sorted(entries, key=lambda x: x["sort_key"])
+    return sorted_entries
 
-        for entry in sorted_entries:
-            st.markdown(f"**PICK {entry['pick_display']}**")
-            st.markdown(f"- Part #: `{entry['part_no']}`")
-            st.markdown(f"- Description: {entry['description']}")
-            st.markdown(f"- Qty Ordered: {entry['qty_ordered']}, Committed: {entry['qty_committed']}, B/O: {entry['qty_bo']}")
-            st.markdown("---")
+# Main app logic
+if uploaded_file:
+    try:
+        sorted_entries = extract_picks_from_pdf(uploaded_file)
 
-        pdf_file = generate_pdf(sorted_entries)
-        with open(pdf_file, "rb") as f:
-            st.download_button("📥 Download PDF", f, file_name="pick_summary.pdf", mime="application/pdf")
-    else:
-        st.error("🚫 No valid PICK entries found.")
+        if sorted_entries:
+            st.success("✅ Extracted and sorted successfully!")
 
+            df = pd.DataFrame(sorted_entries)[["pick", "part_no", "description", "qty_ordered", "qty_committed", "qty_bo"]]
+            df.columns = ["PICK", "Part #", "Description", "Qty Ordered", "Qty Committed", "Qty B/O"]
+            st.dataframe(df, use_container_width=True)
+
+            # PDF Export
+            pdf_file = generate_pdf(sorted_entries)
+            with open(pdf_file, "rb") as f:
+                st.download_button("📄 Download Results as PDF", f, file_name="pick_summary.pdf", mime="application/pdf")
+
+        else:
+            st.warning("⚠️ No valid PICK entries found.")
+    except Exception as e:
+        st.error(f"❌ Error processing file: {e}")
