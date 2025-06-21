@@ -1,107 +1,132 @@
+import streamlit as st
 import fitz  # PyMuPDF
 import re
-import streamlit as st
-import pandas as pd
-from io import BytesIO
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from fpdf import FPDF
+import tempfile
+import os
 
-st.set_page_config(page_title="📦 PICK Ticket Extractor", layout="wide")
-st.title("📄 PICK Ticket PDF Extractor")
+# === Parse Compact Line ===
+def parse_single_line(line):
+    parts = line.strip().split()
+    if 'EA' not in parts or len(parts) < 7:
+        return None
+    try:
+        ea_idx = parts.index('EA')
+        part_no = parts[0]
+        description = " ".join(parts[1:ea_idx])
+        qty_ordered = int(parts[ea_idx + 1])
+        qty_committed = int(parts[ea_idx + 2])
+        qty_bo = int(parts[ea_idx + 3])
+        return {
+            "pick_display": "",  # will fill later
+            "part_no": part_no,
+            "description": description.strip(),
+            "qty_ordered": qty_ordered,
+            "qty_committed": qty_committed,
+            "qty_bo": qty_bo
+        }
+    except:
+        return None
 
-def parse_pdf(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
+# === Parse Multi-Line Block ===
+def parse_multi_line(lines, i):
+    try:
+        pick_raw = lines[i + 1].strip()
+        pick_display = re.match(r'(\d+)', pick_raw).group()
+
+        part_line = lines[i + 2].strip()
+        desc_line = lines[i + 3].strip()
+
+        next_line = lines[i + 4].strip()
+        if next_line == "EA":
+            description = desc_line
+            ea_index = i + 4
+        else:
+            description = f"{desc_line} {next_line}"
+            ea_index = i + 5
+
+        qty_line = lines[ea_index + 1:ea_index + 4]
+        qtys = list(map(int, qty_line))
+
+        return {
+            "pick_display": pick_display,
+            "part_no": part_line,
+            "description": description.strip(),
+            "qty_ordered": qtys[0],
+            "qty_committed": qtys[1],
+            "qty_bo": qtys[2]
+        }, ea_index + 4
+    except:
+        return None, i + 1
+
+# === PDF Generator ===
+def generate_pdf(sorted_entries):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 10, "Sorted PICK Report", ln=True, align='C')
+    pdf.ln(5)
+
+    for entry in sorted_entries:
+        pdf.cell(0, 10, f"PICK {entry['pick_display']}", ln=True)
+        pdf.cell(0, 10, f"  Part #: {entry['part_no']}", ln=True)
+        pdf.cell(0, 10, f"  Description: {entry['description']}", ln=True)
+        pdf.cell(0, 10, f"  Qty Ordered: {entry['qty_ordered']}, Committed: {entry['qty_committed']}, B/O: {entry['qty_bo']}", ln=True)
+        pdf.ln(2)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpfile:
+        pdf.output(tmpfile.name)
+        return tmpfile.name
+
+# === Streamlit App ===
+st.set_page_config(page_title="PICK Ticket Extractor", layout="centered")
+st.title("📦 PICK Ticket Extractor")
+
+uploaded_file = st.file_uploader("Upload your Picking Ticket PDF", type=["pdf"])
+
+if uploaded_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.read())
+        pdf_path = tmp.name
+
+    doc = fitz.open(pdf_path)
     lines = []
     for page in doc:
         lines += page.get_text().splitlines()
 
     entries = []
     i = 0
-
     while i < len(lines):
-        if lines[i].strip() == "PICK":
-            try:
-                pick_raw = lines[i + 1].strip()
-                _ = lines[i + 2].strip()  # often '0'
-                part_no = lines[i + 3].strip()
-
-                # Find where 'EA' is
-                ea_index = -1
-                for j in range(i + 4, i + 10):
-                    if lines[j].strip() == "EA":
-                        ea_index = j
-                        break
-                if ea_index == -1:
-                    raise ValueError("EA not found")
-
-                # Combine all lines between part_no and EA as description
-                description_lines = [lines[k].strip() for k in range(i + 4, ea_index)]
-                description = " ".join(description_lines)
-
-                qty_ordered = int(lines[ea_index + 1].strip())
-                qty_committed = int(lines[ea_index + 2].strip())
-                qty_bo = int(lines[ea_index + 3].strip())
-
-                first_pick_number = re.findall(r'\d+', pick_raw)[0]
-
-                entries.append({
-                    "PICK": first_pick_number,
-                    "Part #": part_no,
-                    "Description": description,
-                    "Qty Ordered": qty_ordered,
-                    "Qty Committed": qty_committed,
-                    "Qty B/O": qty_bo,
-                    "sort_key": int(first_pick_number)
-                })
-
-                i = ea_index + 4
-            except Exception as e:
-                print(f"Skipping block at line {i} due to error: {e}")
-                i += 1
+        line = lines[i].strip()
+        if line == "PICK":
+            block, new_i = parse_multi_line(lines, i)
+            if block:
+                entries.append(block)
+            i = new_i
         else:
+            single = parse_single_line(line)
+            if single:
+                match = re.search(r"PICK\s+(\d+)", "\n".join(lines[max(i - 3, 0):i + 1]))
+                if match:
+                    single["pick_display"] = match.group(1)
+                entries.append(single)
             i += 1
 
-    return sorted(entries, key=lambda x: x["sort_key"])
+    if entries:
+        sorted_entries = sorted(entries, key=lambda x: int(re.match(r'\d+', x["pick_display"]).group()))
+        st.success("✅ Entries successfully parsed and sorted!")
 
-def create_pdf(data):
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+        for entry in sorted_entries:
+            st.markdown(f"**PICK {entry['pick_display']}**")
+            st.markdown(f"- Part #: `{entry['part_no']}`")
+            st.markdown(f"- Description: {entry['description']}")
+            st.markdown(f"- Qty Ordered: {entry['qty_ordered']}, Committed: {entry['qty_committed']}, B/O: {entry['qty_bo']}")
+            st.markdown("---")
 
-    y = height - 40
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, y, "📦 Sorted PICK Entries")
-    y -= 30
-
-    c.setFont("Helvetica", 10)
-    for entry in data:
-        text = (f"PICK {entry['PICK']} | Part #: {entry['Part #']} | "
-                f"Description: {entry['Description']} | "
-                f"Qty: {entry['Qty Ordered']} / {entry['Qty Committed']} / {entry['Qty B/O']}")
-        c.drawString(40, y, text)
-        y -= 18
-        if y < 50:
-            c.showPage()
-            y = height - 40
-            c.setFont("Helvetica", 10)
-
-    c.save()
-    buffer.seek(0)
-    return buffer
-
-# === Streamlit App ===
-uploaded_file = st.file_uploader("📄 Upload your PICKING TICKET PDF", type="pdf")
-
-if uploaded_file:
-    with st.spinner("Processing..."):
-        data = parse_pdf(uploaded_file)
-
-    if data:
-        df = pd.DataFrame(data).drop(columns=["sort_key"])
-        st.success("✅ Extracted and sorted successfully!")
-        st.dataframe(df, use_container_width=True)
-
-        pdf_buffer = create_pdf(data)
-        st.download_button("⬇️ Download Results as PDF", pdf_buffer, file_name="sorted_pick_entries.pdf", mime="application/pdf")
+        pdf_file = generate_pdf(sorted_entries)
+        with open(pdf_file, "rb") as f:
+            st.download_button("📥 Download PDF", f, file_name="pick_summary.pdf", mime="application/pdf")
     else:
-        st.warning("⚠️ No valid PICK entries found.")
+        st.error("🚫 No valid PICK entries found.")
+
