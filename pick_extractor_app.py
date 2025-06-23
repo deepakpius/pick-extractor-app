@@ -1,119 +1,109 @@
 import streamlit as st
 import fitz  # PyMuPDF
+import re
 import pandas as pd
 import tempfile
 from fpdf import FPDF
-import re
-import os
 
-def extract_picks_from_pdf(uploaded_file):
-    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+st.set_page_config(page_title="Pick Ticket Extractor", layout="wide")
+st.title("📄 Deks PICK Ticket Extractor")
+
+uploaded_file = st.file_uploader("Upload your PICKING TICKET PDF", type="pdf")
+
+if uploaded_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        pdf_path = tmp_file.name
+
+    doc = fitz.open(pdf_path)
     lines = []
     for page in doc:
         lines += page.get_text().splitlines()
 
     entries = []
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() == "PICK":
-            try:
-                pick_raw = lines[i + 1].strip()
-                pick_match = re.search(r"\d+", pick_raw)
-                pick_number = pick_match.group() if pick_match else "0"
+    part_number_pattern = re.compile(r'^[A-Z0-9\-/]+$')
 
-                part_no = lines[i + 2].strip()
-                next_line = lines[i + 3].strip()
+    for i in range(6, len(lines)):
+        if lines[i].strip() == "EA":
+            committed_qty = lines[i + 2].strip() if i + 2 < len(lines) else ""
 
-                if next_line == "EA":
-                    description = ""
-                    ea_index = i + 3
-                elif lines[i + 4].strip() == "EA":
-                    description = next_line
-                    ea_index = i + 4
-                elif lines[i + 5].strip() == "EA":
-                    description = f"{next_line} {lines[i + 4].strip()}"
-                    ea_index = i + 5
-                else:
-                    raise ValueError("Expected 'EA' not found")
+            part_number = ""
+            part_candidate_1 = lines[i - 2].strip()
+            part_candidate_2 = lines[i - 3].strip()
 
-                qty_ordered = int(lines[ea_index + 1].strip())
-                qty_committed = int(lines[ea_index + 2].strip())
-                qty_bo = int(lines[ea_index + 3].strip())
+            if part_number_pattern.match(part_candidate_1):
+                part_number = part_candidate_1
+            elif part_number_pattern.match(part_candidate_2):
+                part_number = part_candidate_2
 
+            bin_value = ""
+            for j in range(i - 1, i - 10, -1):
+                if "PICK" in lines[j]:
+                    pick_line = lines[j].strip()
+
+                    if pick_line.startswith("PICK ") and len(pick_line.split()) > 1:
+                        bin_text = pick_line.split(" ", 1)[1]
+                        bin_value = bin_text.split(',')[0].split()[0]
+
+                    elif pick_line.strip() == "PICK" and j + 1 < len(lines):
+                        bin_line = lines[j + 1].strip()
+                        bin_value = bin_line.split(',')[0].split()[0]
+
+                    elif pick_line.startswith("PICK") and len(pick_line) > 4 and j + 1 < len(lines):
+                        pick_suffix = pick_line[4:].strip()
+                        next_line = lines[j + 1].strip()
+                        bin_value = (pick_suffix + next_line).split(',')[0].split()[0]
+                    break
+
+            if bin_value and part_number:
                 entries.append({
-                    "PICK": pick_number,
-                    "Part #": part_no,
-                    "Description": description.strip(),
-                    "Qty Ordered": qty_ordered,
-                    "Qty Committed": qty_committed,
-                    "Qty B/O": qty_bo
+                    "PICK": bin_value,
+                    "Part #": part_number,
+                    "Qty Committed": committed_qty
                 })
 
-                i = ea_index + 4
-            except Exception as e:
-                print(f"Skipping block at line {i} due to error: {e}")
-                i += 1
-        else:
-            i += 1
-
-    return sorted(entries, key=lambda x: int(x["PICK"]))
-
-def generate_pdf_table(entries):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.set_font("Arial", size=10)
-
-    col_widths = [20, 35, 70, 20, 25, 20]
-    headers = ["PICK", "Part #", "Description", "Qty Ordered", "Qty Committed", "Qty B/O"]
-
-    for i, header in enumerate(headers):
-        pdf.cell(col_widths[i], 10, header, border=1)
-    pdf.ln()
-
-    for entry in entries:
-        row = [
-            entry['PICK'],
-            entry['Part #'],
-            entry['Description'],
-            str(entry['Qty Ordered']),
-            str(entry['Qty Committed']),
-            str(entry['Qty B/O'])
-        ]
-        for i, item in enumerate(row):
-            pdf.cell(col_widths[i], 10, item.encode('latin-1', 'replace').decode('latin-1'), border=1)
-        pdf.ln()
-
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    pdf.output(tmp_file.name)
-    return tmp_file.name
-
-# Streamlit UI
-st.set_page_config(page_title="PICK Ticket PDF Extractor", layout="centered")
-st.title("📄 PICK Ticket PDF Extractor")
-
-uploaded_file = st.file_uploader("Upload your PICKING TICKET PDF", type=["pdf"])
-
-if uploaded_file is not None:
-    with st.spinner("🔍 Extracting data from PDF..."):
+    def sort_key(entry):
         try:
-            sorted_entries = extract_picks_from_pdf(uploaded_file)
-            if sorted_entries:
-                df = pd.DataFrame(sorted_entries)
-                st.success("✅ Extracted and sorted successfully!")
-                st.dataframe(df, use_container_width=True)
+            return int(entry["PICK"])
+        except:
+            return entry["PICK"]
 
-                pdf_path = generate_pdf_table(sorted_entries)
-                with open(pdf_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Download Results as PDF",
-                        data=f,
-                        file_name="picking_ticket_output.pdf",
-                        mime="application/pdf"
-                    )
+    sorted_entries = sorted(entries, key=sort_key)
 
-                os.remove(pdf_path)
-            else:
-                st.warning("⚠️ No valid PICK entries found in the uploaded PDF.")
-        except Exception as e:
-            st.error(f"❌ Error processing PDF: {e}")
+    if sorted_entries:
+        df = pd.DataFrame(sorted_entries)
+        st.success("Extracted and sorted successfully!")
+        st.dataframe(df, use_container_width=True)
+
+        class PDFTable(FPDF):
+            def header(self):
+                self.set_font("Arial", "B", 12)
+                self.cell(0, 10, "Pick Ticket Summary", 0, 1, "C")
+
+            def table(self, data):
+                self.set_font("Arial", "B", 10)
+                col_widths = [30, 80, 40]
+                headers = ["PICK", "Part #", "Qty Committed"]
+
+                for i, header in enumerate(headers):
+                    self.cell(col_widths[i], 10, header, border=1)
+                self.ln()
+
+                self.set_font("Arial", "", 10)
+                for _, row in data.iterrows():
+                    self.cell(col_widths[0], 10, str(row["PICK"]), border=1)
+                    self.cell(col_widths[1], 10, str(row["Part #"]), border=1)
+                    self.cell(col_widths[2], 10, str(row["Qty Committed"]), border=1)
+                    self.ln()
+
+        pdf = PDFTable()
+        pdf.add_page()
+        pdf.table(df)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpfile:
+            pdf.output(tmpfile.name)
+            with open(tmpfile.name, "rb") as f:
+                st.download_button("📥 Download Results as PDF", f.read(), file_name="pick_ticket_summary.pdf", mime="application/pdf")
+
+    else:
+        st.warning("No valid entries found in the PDF.")
