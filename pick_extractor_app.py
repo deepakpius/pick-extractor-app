@@ -5,8 +5,15 @@ import pandas as pd
 import tempfile
 from fpdf import FPDF
 
-st.set_page_config(page_title="Pick Ticket Extractor", layout="wide")
-st.title("📄 Deks PICK Ticket Extractor")
+st.set_page_config(page_title="Deks Industries", layout="wide")
+#st.title("📄 Picking Ticket Sorter")
+
+# Display logo and title
+col1, col2 = st.columns([1, 6])
+with col1:
+    st.image("https://d1hbpr09pwz0sk.cloudfront.net/logo_url/deks-industries-australasia-405aec84", width=80)  # Placeholder logo URL
+with col2:
+    st.title("📄 Picking Ticket Sorter")
 
 uploaded_file = st.file_uploader("Upload your PICKING TICKET PDF", type="pdf")
 
